@@ -54,62 +54,33 @@ module.exports = async (req, res) => {
 
   const orderId = refund.order_id;
 
-  // 1️⃣ Lekérjük az order részleteit (customer ID + metafieldek)
-  let customerId, osszes_koltes = 0, order_share = 0;
+  // 🔧 1) Lekérjük a refundolt order adatait, hogy megszerezzük a customer id-t
+  let customerId;
   try {
     const orderQuery = `
       query {
         order(id: "gid://shopify/Order/${orderId}") {
           customer { id }
-          metafields(first: 10, namespace: "custom") {
-            edges {
-              node {
-                key
-                value
-              }
-            }
-          }
         }
       }`;
 
     const orderRes = await fetch(endpoint, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': token
-      },
+      headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token },
       body: JSON.stringify({ query: orderQuery })
     });
 
     const orderJson = await orderRes.json();
-
-    if (!orderJson.data.order) {
-      throw new Error('Order not found.');
-    }
-
     customerId = orderJson.data.order.customer?.id;
 
-    const metafields = orderJson.data.order.metafields.edges;
-    for (const edge of metafields) {
-      if (edge.node.key === 'osszes_koltes') {
-        osszes_koltes = parseFloat(edge.node.value);
-      }
-      if (edge.node.key === 'order_share') {
-        order_share = parseInt(edge.node.value);
-      }
-    }
-
-    if (!customerId) {
-      throw new Error('Customer not found.');
-    }
-
+    if (!customerId) throw new Error("Customer not found.");
   } catch (err) {
     console.error('Error fetching order data:', err);
     res.writeHead(500);
-    return res.end('Error fetching order data');
+    return res.end('Error fetching order');
   }
 
-  // 2️⃣ Refund összeg kiszámítása
+  // 🔧 2) Refund összeg kiszámítása
   let refundSubtotal = 0;
   for (const refundItem of refund.refund_line_items || []) {
     const amount = parseFloat(refundItem.subtotal_set?.presentment_money?.amount || 0);
@@ -117,158 +88,120 @@ module.exports = async (req, res) => {
   }
   console.log(`💸 Refund subtotal: ${refundSubtotal}`);
 
-  // 3️⃣ Új osszes_koltes és új order_share számolása
-  let newOrderOsszesKoltes = osszes_koltes - refundSubtotal;
-  if (newOrderOsszesKoltes < 0) newOrderOsszesKoltes = 0;
-
-  const fennmarado = newOrderOsszesKoltes % shareUnit;
-  const totalShares = Math.floor(newOrderOsszesKoltes / shareUnit);
-  const newOrderShares = totalShares;
-
-  console.log(`📉 New order osszes_koltes: ${newOrderOsszesKoltes}`);
-  console.log(`📉 New order share: ${newOrderShares}`);
-
-  // 4️⃣ Order metafield update
+  // 🔧 3) Lekérjük az összes customerhez tartozó order-t
+  let orders = [];
   try {
+    const ordersQuery = `
+      query {
+        customer(id: "${customerId}") {
+          orders(first: 100, sortKey: CREATED_AT, reverse: false) {
+            edges {
+              node {
+                id
+                name
+                subtotalPriceSet { presentmentMoney { amount } }
+                metafields(first: 10, namespace: "custom") {
+                  edges {
+                    node { key value }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }`;
+
+    const ordersRes = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token },
+      body: JSON.stringify({ query: ordersQuery })
+    });
+
+    const ordersJson = await ordersRes.json();
+    orders = ordersJson.data.customer.orders.edges;
+
+  } catch (err) {
+    console.error('Error fetching customer orders:', err);
+    res.writeHead(500);
+    return res.end('Error fetching orders');
+  }
+
+  // 🔧 4) Újraszámoljuk az összes rendelést sorrendben
+  let cumulativeSpending = 0;
+  let cumulativeShares = 0;
+
+  for (const edge of orders) {
+    const order = edge.node;
+    const shopifyOrderId = order.id;
+    const subtotal = parseFloat(order.subtotalPriceSet.presentmentMoney.amount);
+
+    let refundForThisOrder = 0;
+    if (order.name === `#${refund.order_name}` || shopifyOrderId.includes(orderId)) {
+      refundForThisOrder = refundSubtotal;
+    }
+
+    const adjustedSubtotal = Math.max(0, subtotal - refundForThisOrder);
+    cumulativeSpending += adjustedSubtotal;
+
+    const fennmarado_osszeg = cumulativeSpending % shareUnit;
+    const totalSharesNow = Math.floor(cumulativeSpending / shareUnit);
+    const orderShares = totalSharesNow - cumulativeShares;
+    cumulativeShares = totalSharesNow;
+
+    console.log(`🔄 Recalculating order ${order.name}: cumulativeSpending=${cumulativeSpending}, shares=${orderShares}`);
+
     const updateOrderMutation = `
       mutation orderUpdate($input: OrderInput!) {
-        orderUpdate(input: $input) {
-          userErrors { field message }
-        }
+        orderUpdate(input: $input) { userErrors { field message } }
       }`;
 
     const orderVariables = {
       input: {
-        id: `gid://shopify/Order/${orderId}`,
+        id: shopifyOrderId,
         metafields: [
-          {
-            namespace: 'custom',
-            key: 'osszes_koltes',
-            type: 'number_decimal',
-            value: newOrderOsszesKoltes.toFixed(2)
-          },
-          {
-            namespace: 'custom',
-            key: 'fennmarado_osszeg',
-            type: 'number_decimal',
-            value: fennmarado.toFixed(2)
-          },
-          {
-            namespace: 'custom',
-            key: 'order_share',
-            type: 'number_integer',
-            value: newOrderShares.toString()
-          }
+          { namespace: 'custom', key: 'osszes_koltes', type: 'number_decimal', value: cumulativeSpending.toFixed(2) },
+          { namespace: 'custom', key: 'fennmarado_osszeg', type: 'number_decimal', value: fennmarado_osszeg.toFixed(2) },
+          { namespace: 'custom', key: 'order_share', type: 'number_integer', value: orderShares.toString() }
         ]
       }
     };
 
-    const orderUpdateRes = await fetch(endpoint, {
+    await fetch(endpoint, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': token
-      },
+      headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token },
       body: JSON.stringify({ query: updateOrderMutation, variables: orderVariables })
     });
-
-    const orderUpdateJson = await orderUpdateRes.json();
-    const orderErrs = orderUpdateJson.data.orderUpdate.userErrors;
-    if (orderErrs.length) {
-      console.error('Order update errors:', orderErrs);
-    }
-  } catch (err) {
-    console.error('Error updating order metafields:', err);
   }
 
-  // 5️⃣ Customer current net spent lekérése
-  let previousSpending = 0;
+  // 🔧 5) Customer metafield update
   try {
-    const getQ = `
-      query {
-        customer(id: "${customerId}") {
-          metafield(namespace: "loyalty", key: "net_spent_total") { value }
-        }
-      }`;
-
-    const getRes = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': token
-      },
-      body: JSON.stringify({ query: getQ })
-    });
-
-    const getJson = await getRes.json();
-    const rawValue = getJson.data.customer.metafield?.value;
-    previousSpending = rawValue ? parseFloat(rawValue) : 0;
-  } catch (err) {
-    console.error('Error fetching customer metafield:', err);
-    res.writeHead(500);
-    return res.end('Error fetching customer metafield');
-  }
-
-  // 6️⃣ Customer update
-  let newTotalSpending = previousSpending - refundSubtotal;
-  if (newTotalSpending < 0) newTotalSpending = 0;
-
-  const totalCustomerShares = Math.floor(newTotalSpending / shareUnit);
-  const fennmaradoCustomer = newTotalSpending % shareUnit;
-
-  try {
+    const fennmaradoCustomer = cumulativeSpending % shareUnit;
     const customerMutation = `
       mutation customerUpdate($input: CustomerInput!) {
-        customerUpdate(input: $input) {
-          userErrors { field message }
-        }
+        customerUpdate(input: $input) { userErrors { field message } }
       }`;
 
     const customerVariables = {
       input: {
         id: customerId,
         metafields: [
-          {
-            namespace: 'loyalty',
-            key: 'net_spent_total',
-            type: 'number_decimal',
-            value: newTotalSpending.toFixed(2)
-          },
-          {
-            namespace: 'loyalty',
-            key: 'reszvenyek_szama',
-            type: 'number_integer',
-            value: totalCustomerShares.toString()
-          },
-          {
-            namespace: 'custom',
-            key: 'jelenlegi_fennmarado',
-            type: 'number_decimal',
-            value: fennmaradoCustomer.toFixed(2)
-          }
+          { namespace: 'loyalty', key: 'net_spent_total', type: 'number_decimal', value: cumulativeSpending.toFixed(2) },
+          { namespace: 'loyalty', key: 'reszvenyek_szama', type: 'number_integer', value: cumulativeShares.toString() },
+          { namespace: 'custom', key: 'jelenlegi_fennmarado', type: 'number_decimal', value: fennmaradoCustomer.toFixed(2) }
         ]
       }
     };
 
-    const customerRes = await fetch(endpoint, {
+    await fetch(endpoint, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': token
-      },
+      headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token },
       body: JSON.stringify({ query: customerMutation, variables: customerVariables })
     });
-
-    const customerJson = await customerRes.json();
-    const customerErrs = customerJson.data.customerUpdate.userErrors;
-    if (customerErrs.length) {
-      console.error('Customer update errors:', customerErrs);
-    }
   } catch (err) {
     console.error('Error updating customer metafields:', err);
   }
 
-  console.log('✅ Refund processed successfully.');
+  console.log('✅ Refund recalculation finished successfully.');
   res.writeHead(200);
   res.end('OK');
 };
