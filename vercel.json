@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "routes": [
+    {
+      "src": "/webhook/order-creation",
+      "dest": "/api/webhook-order-creation.js"
+    },
+    {
+      "src": "/webhook/refund",
+      "dest": "/api/webhook-refund.js"
+    }
+  ]
+}
