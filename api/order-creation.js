@@ -10,12 +10,11 @@ async function getRawBody(req) {
 }
 
 module.exports = async (req, res) => {
-  // Csak POST kérésekre válaszolunk
   if (req.method !== 'POST') {
     return res.writeHead(405, { Allow: 'POST' }).end('Method Not Allowed');
   }
 
-  // 1) Raw body + HMAC validálás
+  // 1) Raw body + HMAC
   let buf;
   try {
     buf = await getRawBody(req);
@@ -23,18 +22,16 @@ module.exports = async (req, res) => {
     console.error('❌ Error reading body:', e);
     return res.writeHead(400).end('Invalid body');
   }
-  const hmacHeader = req.headers['x-shopify-hmac-sha256'];
-  const expected = crypto
-    .createHmac('sha256', process.env.SHOPIFY_API_SECRET_KEY)
-    .update(buf)
-    .digest('base64');
-  if (!hmacHeader || hmacHeader !== expected) {
-    console.error('❌ HMAC validation failed (got %s, expected %s)', hmacHeader, expected);
+  const hmac   = req.headers['x-shopify-hmac-sha256'];
+  const digest = crypto.createHmac('sha256', process.env.SHOPIFY_API_SECRET_KEY)
+                       .update(buf).digest('base64');
+  if (!hmac || hmac !== digest) {
+    console.error('❌ HMAC validation failed (got %s, expected %s)', hmac, digest);
     return res.writeHead(401).end('HMAC validation failed');
   }
   console.log('✅ HMAC passed');
 
-  // 2) Payload parse
+  // 2) Parse the order payload
   let order;
   try {
     order = JSON.parse(buf.toString());
@@ -44,13 +41,14 @@ module.exports = async (req, res) => {
   }
   console.log(`🔔 Received order creation: ${order.id}`);
 
-  // 3) Előző net_spent_total lekérdezése
+  // 3) Prepare
   const shop      = process.env.SHOPIFY_SHOP_NAME;
   const token     = process.env.SHOPIFY_API_ACCESS_TOKEN;
   const endpoint  = `https://${shop}.myshopify.com/admin/api/2023-10/graphql.json`;
   const shareUnit = 12700;
   const subtotal  = parseFloat(order.subtotal_price);
 
+  // 4) Fetch previous net_spent_total
   let prev = 0;
   try {
     const readRes = await fetch(endpoint, {
@@ -85,7 +83,7 @@ module.exports = async (req, res) => {
     return res.writeHead(500).end('Fetch previous spending error');
   }
 
-  // 4) Új értékek kiszámolása
+  // 5) Compute new values
   const total       = prev + subtotal;
   const prevShares  = Math.floor(prev / shareUnit);
   const totalShares = Math.floor(total / shareUnit);
@@ -97,7 +95,7 @@ module.exports = async (req, res) => {
   console.log('🎯 New shares:      ', newShares);
   console.log('💰 New remainder:   ', remCurrent.toFixed(2));
 
-  // 5) Egyetlen, változókat használó mutáció
+  // 6) One-shot GraphQL mutation using variables
   try {
     const mutRes = await fetch(endpoint, {
       method: 'POST',
@@ -110,26 +108,26 @@ module.exports = async (req, res) => {
           mutation updateBoth(
             $custId: ID!,
             $orderGid: ID!,
-            $total: Decimal!,
+            $total: String!,
             $shares: Int!,
-            $subt: Decimal!,
-            $rem: Decimal!
+            $subt: String!,
+            $rem: String!
           ) {
             customerUpdate(input: {
               id: $custId,
               metafields: [
-                { namespace: "loyalty", key: "net_spent_total",  type: "number_decimal",  value: $total },
-                { namespace: "loyalty", key: "reszvenyek_szama", type: "number_integer",  value: $shares },
-                { namespace: "loyalty", key: "last_order_value", type: "number_decimal",  value: $subt },
+                { namespace: "loyalty", key: "net_spent_total",     type: "number_decimal",  value: $total },
+                { namespace: "loyalty", key: "reszvenyek_szama",    type: "number_integer",  value: $shares },
+                { namespace: "loyalty", key: "last_order_value",    type: "number_decimal",  value: $subt },
                 { namespace: "custom",  key: "jelenlegi_fennmarado", type: "number_decimal",  value: $rem }
               ]
             }) { userErrors { field message } }
             orderUpdate(input: {
               id: $orderGid,
               metafields: [
-                { namespace: "custom", key: "order_share",      type: "number_integer",  value: $shares },
-                { namespace: "custom", key: "osszes_koltes",     type: "number_decimal",  value: $total },
-                { namespace: "custom", key: "fennmarado_osszeg", type: "number_decimal",  value: $rem }
+                { namespace: "custom", key: "order_share",      type: "number_integer", value: $shares },
+                { namespace: "custom", key: "osszes_koltes",     type: "number_decimal", value: $total },
+                { namespace: "custom", key: "fennmarado_osszeg", type: "number_decimal", value: $rem }
               ]
             }) { userErrors { field message } }
           }
@@ -137,10 +135,10 @@ module.exports = async (req, res) => {
         variables: {
           custId:   `gid://shopify/Customer/${order.customer.id}`,
           orderGid: `gid://shopify/Order/${order.id}`,
-          total,      // szám típus
-          shares:     newShares,
-          subt:       subtotal,
-          rem:        remCurrent
+          total:    total.toFixed(2),     // pass as String!
+          shares:   newShares,            // Int!
+          subt:     subtotal.toFixed(2),  // String!
+          rem:      remCurrent.toFixed(2) // String!
         }
       })
     });
