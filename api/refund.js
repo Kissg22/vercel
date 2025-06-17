@@ -12,12 +12,14 @@ async function getRawBody(req) {
 
 module.exports = async (req, res) => {
   console.log('▶️  /refund endpoint hit');
+
+  // 1) Csak POST
   if (req.method !== 'POST') {
     console.log('✋ Method not allowed:', req.method);
     return res.writeHead(405, { Allow: 'POST' }).end('Method Not Allowed');
   }
 
-  // 1) Raw body + HMAC validáció
+  // 2) Raw body + HMAC validáció
   let buf;
   try {
     buf = await getRawBody(req);
@@ -28,11 +30,11 @@ module.exports = async (req, res) => {
   }
 
   const hmacHeader = req.headers['x-shopify-hmac-sha256'];
-  console.log('🔐 Received HMAC header:', hmacHeader);
   const computed = crypto
     .createHmac('sha256', process.env.SHOPIFY_API_SECRET_KEY)
     .update(buf)
     .digest('base64');
+  console.log('🔐 Received HMAC header:', hmacHeader);
   console.log('🔑 Computed HMAC:', computed);
 
   if (!hmacHeader || computed !== hmacHeader) {
@@ -41,7 +43,7 @@ module.exports = async (req, res) => {
   }
   console.log('✅ HMAC validation passed');
 
-  // 2) Payload parse
+  // 3) Payload parse
   let payload;
   try {
     payload = JSON.parse(buf.toString());
@@ -51,61 +53,50 @@ module.exports = async (req, res) => {
     return res.writeHead(400).end('Invalid JSON');
   }
 
-  console.log(`🔔 Received refund webhook for order: ${payload.order_id}`);
+  const orderId = payload.order_id;
+  console.log(`🔔 Refund webhook for order_id: ${orderId}`);
 
-  // 3) Customer ID kinyerése
-  let customerGid = payload.customer?.id;
-  console.log('👤 Initial payload.customer.id:', customerGid);
-  if (!customerGid) {
-    console.log('🔍 customer.id missing, fetching via GraphQL order query');
-    const endpoint = `https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/2023-10/graphql.json`;
-    const orderQuery = `
-      query {
-        order(id: "gid://shopify/Order/${payload.order_id}") {
-          customer { id }
-        }
-      }`;
-    try {
-      const orderRes = await fetch(endpoint, {
-        method: 'POST',
+  // 4) Customer ID kinyerése REST API‐val
+  let customerId;
+  try {
+    console.log('🔍 Fetching order via REST to get customer ID');
+    const resp = await fetch(
+      `https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/2023-10/orders/${orderId}.json?fields=customer`,
+      {
         headers: {
-          'Content-Type':           'application/json',
-          'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN
-        },
-        body: JSON.stringify({ query: orderQuery })
-      });
-      const orderJson = await orderRes.json();
-      customerGid = orderJson.data.order.customer?.id;
-      console.log('🔍 Fetched customerGid via GraphQL:', customerGid);
-    } catch (e) {
-      console.error('❌ Error fetching order for customer ID:', e);
-      return res.writeHead(500).end('Error fetching customer');
-    }
+          'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    if (!resp.ok) throw new Error(`Status ${resp.status}`);
+    const body = await resp.json();
+    customerId = body.order.customer?.id;
+    console.log('✅ REST fetched customer.id:', customerId);
+  } catch (e) {
+    console.error('❌ REST fetch order/customer failed:', e);
   }
 
-  if (!customerGid) {
-    console.error('❌ Still no customer ID available, aborting');
+  if (!customerId) {
+    console.error('❌ No customer ID after REST lookup, aborting');
     return res.writeHead(400).end('No customer ID');
   }
 
-  const customerId = String(customerGid).split('/').pop();
-  console.log('🔢 Numeric customer ID:', customerId);
+  // numeric ID
+  const numericCustomerId = String(customerId).split('/').pop();
+  console.log('🔢 Numeric customer ID:', numericCustomerId);
 
-  // 4) Teljes újraszámolás
-  console.log('🔄 Starting recalcCustomer...');
-  try {
-    await recalcCustomer(
-      process.env.SHOPIFY_SHOP_NAME,
-      process.env.SHOPIFY_API_ACCESS_TOKEN,
-      customerId
-    );
-    console.log('✅ recalcCustomer completed successfully');
-  } catch (e) {
-    console.error('❌ Recalculation failed:', e);
-    return res.writeHead(500).end('Recalc error');
-  }
+  // 5) Fire-and-forget recalcCustomer
+  console.log('🔄 Triggering background recalcCustomer...');
+  recalcCustomer(
+    process.env.SHOPIFY_SHOP_NAME,
+    process.env.SHOPIFY_API_ACCESS_TOKEN,
+    numericCustomerId
+  )
+    .then(() => console.log('✅ Background recalcCustomer done'))
+    .catch(err => console.error('❌ Background recalcCustomer error:', err));
 
-  // 5) Válasz
-  console.log('🏁 Refund handling finished, sending 200 OK');
+  // 6) Azonnali válasz
+  console.log('🏁 Refund handler returning 200 OK');
   res.writeHead(200).end('OK');
 };
