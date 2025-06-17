@@ -3,15 +3,15 @@
   "routes": [
     {
       "src": "/webhook/order-creation",
-      "dest": "/api/webhook-order-creation.js"
+      "dest": "/api/order-creation.js"
     },
     {
       "src": "/webhook/refund",
-      "dest": "/api/webhook-refund.js"
+      "dest": "/api/refund.js"
     },
     {
       "src": "/webhook/order-cancel",
-      "dest": "/api/webhook-order-cancel.js"
+      "dest": "/api/order-cancel.js"
     }
   ]
 }
