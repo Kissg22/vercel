@@ -22,7 +22,7 @@ module.exports = async (req, res) => {
   const digest = crypto.createHmac('sha256', process.env.SHOPIFY_API_SECRET_KEY)
                        .update(buf).digest('base64');
   if (!hmac || hmac !== digest) {
-    console.error('❌ HMAC failed (got %s, expected %s)', hmac, digest);
+    console.error('❌ HMAC validation failed (got %s, expected %s)', hmac, digest);
     return res.writeHead(401).end('HMAC validation failed');
   }
   console.log('✅ HMAC passed');
@@ -30,7 +30,7 @@ module.exports = async (req, res) => {
   // 2) Parse payload
   let order;
   try { order = JSON.parse(buf.toString()); }
-  catch (e) { console.error('❌ Invalid JSON:', e); return res.writeHead(400).end('Invalid JSON'); }
+  catch (e) { console.error('❌ Invalid JSON payload:', e); return res.writeHead(400).end('Invalid JSON'); }
   console.log(`🔔 Received order creation: ${order.id}`);
 
   const subtotal   = parseFloat(order.subtotal_price);
@@ -39,7 +39,7 @@ module.exports = async (req, res) => {
   const endpoint   = `https://${shop}.myshopify.com/admin/api/2023-10/graphql.json`;
   const shareUnit  = 12700;
 
-  // 3) Lekérdezzük előbb a korábbi net_spent_total-t
+  // 3) Lekérdezzük az előző net_spent_total-t
   let prev = 0;
   try {
     const readRes = await fetch(endpoint, {
@@ -58,9 +58,7 @@ module.exports = async (req, res) => {
             }
           }
         `,
-        variables: {
-          custId: `gid://shopify/Customer/${order.customer.id}`
-        }
+        variables: { custId: `gid://shopify/Customer/${order.customer.id}` }
       })
     });
     const { data, errors } = await readRes.json();
@@ -86,23 +84,16 @@ module.exports = async (req, res) => {
   console.log('🎯 Shares earned:', newShares);
   console.log('💰 New remainder:', remCurrent.toFixed(2));
 
-  // 5) Egyetlen mutation mindkét update-re
+  // 5) Egyetlen mutation – Decimal értékeket inline, csak Int változó
   const mutation = `
-    mutation updateBoth(
-      $custId: ID!,
-      $orderGid: ID!,
-      $total: Decimal!,
-      $shares: Int!,
-      $subt: Decimal!,
-      $rem: Decimal!
-    ) {
+    mutation updateBoth($custId: ID!, $orderGid: ID!, $shares: Int!) {
       customerUpdate(input: {
         id: $custId,
         metafields: [
-          { namespace: "loyalty", key: "net_spent_total",  type: "number_decimal",  value: $total },
-          { namespace: "loyalty", key: "reszvenyek_szama", type: "number_integer",  value: $shares },
-          { namespace: "loyalty", key: "last_order_value", type: "number_decimal",  value: $subt },
-          { namespace: "custom",  key: "jelenlegi_fennmarado", type: "number_decimal", value: $rem }
+          { namespace: "loyalty", key: "net_spent_total",     type: "number_decimal",  value: "${total.toFixed(2)}" },
+          { namespace: "loyalty", key: "reszvenyek_szama",    type: "number_integer",  value: $shares },
+          { namespace: "loyalty", key: "last_order_value",    type: "number_decimal",  value: "${subtotal.toFixed(2)}" },
+          { namespace: "custom",  key: "jelenlegi_fennmarado", type: "number_decimal",  value: "${remCurrent.toFixed(2)}" }
         ]
       }) {
         userErrors { field message }
@@ -110,9 +101,9 @@ module.exports = async (req, res) => {
       orderUpdate(input: {
         id: $orderGid,
         metafields: [
-          { namespace: "custom", key: "order_share",       type: "number_integer", value: $shares },
-          { namespace: "custom", key: "osszes_koltes",      type: "number_decimal", value: $total },
-          { namespace: "custom", key: "fennmarado_osszeg",  type: "number_decimal", value: $rem }
+          { namespace: "custom", key: "order_share",      type: "number_integer", value: $shares },
+          { namespace: "custom", key: "osszes_koltes",     type: "number_decimal",  value: "${total.toFixed(2)}" },
+          { namespace: "custom", key: "fennmarado_osszeg", type: "number_decimal",  value: "${remCurrent.toFixed(2)}" }
         ]
       }) {
         userErrors { field message }
@@ -122,10 +113,7 @@ module.exports = async (req, res) => {
   const variables = {
     custId:   `gid://shopify/Customer/${order.customer.id}`,
     orderGid: `gid://shopify/Order/${order.id}`,
-    total:    total.toFixed(2),    // Decimal típusnak string
-    shares:   newShares,           // Int típusnak number
-    subt:     subtotal.toFixed(2),
-    rem:      remCurrent.toFixed(2)
+    shares:   newShares
   };
 
   try {
