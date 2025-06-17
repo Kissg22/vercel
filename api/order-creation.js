@@ -14,7 +14,7 @@ module.exports = async (req, res) => {
     return res.writeHead(405, { Allow: 'POST' }).end('Method Not Allowed');
   }
 
-  // 1) Raw body + HMAC
+  // 1) Raw body + HMAC validálás
   let buf;
   try { buf = await getRawBody(req); }
   catch (e) { console.error('❌ Error reading body:', e); return res.writeHead(400).end('Invalid body'); }
@@ -28,7 +28,7 @@ module.exports = async (req, res) => {
   }
   console.log('✅ HMAC passed');
 
-  // 2) Parse payload
+  // 2) Payload parse
   let order;
   try { order = JSON.parse(buf.toString()); }
   catch (e) { console.error('❌ Invalid JSON payload:', e); return res.writeHead(400).end('Invalid JSON'); }
@@ -40,7 +40,7 @@ module.exports = async (req, res) => {
   const endpoint  = `https://${shop}.myshopify.com/admin/api/2023-10/graphql.json`;
   const shareUnit = 12700;
 
-  // 3) Lekérdezzük a korábbi net_spent_total-t
+  // 3) Lekérdezzük az előző net_spent_total-t
   let prev = 0;
   try {
     const readRes = await fetch(endpoint, {
@@ -75,7 +75,7 @@ module.exports = async (req, res) => {
     return res.writeHead(500).end('Fetch previous spending error');
   }
 
-  // 4) Új értékek
+  // 4) Új értékek kiszámolása
   const total       = prev + subtotal;
   const prevShares  = Math.floor(prev / shareUnit);
   const totalShares = Math.floor(total / shareUnit);
@@ -87,7 +87,7 @@ module.exports = async (req, res) => {
   console.log('🎯 New shares:      ', newShares);
   console.log('💰 New remainder:   ', remCurrent.toFixed(2));
 
-  // 5) Egyetlen mutation, csak UPDATE-k
+  // 5) Egyetlen mutation a frissítésre
   try {
     const mutRes = await fetch(endpoint, {
       method: 'POST',
@@ -127,10 +127,10 @@ module.exports = async (req, res) => {
         variables: {
           custId:   `gid://shopify/Customer/${order.customer.id}`,
           orderGid: `gid://shopify/Order/${order.id}`,
-          total:    total.toFixed(2),
+          total,     // **most számként** adjuk át
           shares:   newShares,
-          subt:     subtotal.toFixed(2),
-          rem:      remCurrent.toFixed(2)
+          subt:     subtotal,
+          rem:      remCurrent
         }
       })
     });
@@ -139,8 +139,10 @@ module.exports = async (req, res) => {
       console.error('❌ Mutation-level errors:', mjson.errors);
       return res.writeHead(500).end('Mutation errors');
     }
-    if (mjson.data.customerUpdate.userErrors.length || mjson.data.orderUpdate.userErrors.length) {
-      console.error('❌ Field-level userErrors:', mjson.data);
+    const cuErrs = mjson.data.customerUpdate.userErrors;
+    const ouErrs = mjson.data.orderUpdate.userErrors;
+    if (cuErrs.length || ouErrs.length) {
+      console.error('❌ Field-level userErrors:', { cuErrs, ouErrs });
       return res.writeHead(500).end('UserErrors on mutation');
     }
     console.log('✅ Mutation succeeded:', JSON.stringify(mjson.data, null,2));
