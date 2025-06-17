@@ -10,37 +10,47 @@ async function getRawBody(req) {
 }
 
 module.exports = async (req, res) => {
+  // Csak POST kérésekre válaszolunk
   if (req.method !== 'POST') {
     return res.writeHead(405, { Allow: 'POST' }).end('Method Not Allowed');
   }
 
   // 1) Raw body + HMAC validálás
   let buf;
-  try { buf = await getRawBody(req); }
-  catch (e) { console.error('❌ Error reading body:', e); return res.writeHead(400).end('Invalid body'); }
-
-  const hmac   = req.headers['x-shopify-hmac-sha256'];
-  const digest = crypto.createHmac('sha256', process.env.SHOPIFY_API_SECRET_KEY)
-                       .update(buf).digest('base64');
-  if (!hmac || hmac !== digest) {
-    console.error('❌ HMAC validation failed (got %s, expected %s)', hmac, digest);
+  try {
+    buf = await getRawBody(req);
+  } catch (e) {
+    console.error('❌ Error reading body:', e);
+    return res.writeHead(400).end('Invalid body');
+  }
+  const hmacHeader = req.headers['x-shopify-hmac-sha256'];
+  const expected = crypto
+    .createHmac('sha256', process.env.SHOPIFY_API_SECRET_KEY)
+    .update(buf)
+    .digest('base64');
+  if (!hmacHeader || hmacHeader !== expected) {
+    console.error('❌ HMAC validation failed (got %s, expected %s)', hmacHeader, expected);
     return res.writeHead(401).end('HMAC validation failed');
   }
   console.log('✅ HMAC passed');
 
   // 2) Payload parse
   let order;
-  try { order = JSON.parse(buf.toString()); }
-  catch (e) { console.error('❌ Invalid JSON payload:', e); return res.writeHead(400).end('Invalid JSON'); }
+  try {
+    order = JSON.parse(buf.toString());
+  } catch (e) {
+    console.error('❌ Invalid JSON payload:', e);
+    return res.writeHead(400).end('Invalid JSON');
+  }
   console.log(`🔔 Received order creation: ${order.id}`);
 
-  const subtotal  = parseFloat(order.subtotal_price);
+  // 3) Előző net_spent_total lekérdezése
   const shop      = process.env.SHOPIFY_SHOP_NAME;
   const token     = process.env.SHOPIFY_API_ACCESS_TOKEN;
   const endpoint  = `https://${shop}.myshopify.com/admin/api/2023-10/graphql.json`;
   const shareUnit = 12700;
+  const subtotal  = parseFloat(order.subtotal_price);
 
-  // 3) Lekérdezzük az előző net_spent_total-t
   let prev = 0;
   try {
     const readRes = await fetch(endpoint, {
@@ -87,7 +97,7 @@ module.exports = async (req, res) => {
   console.log('🎯 New shares:      ', newShares);
   console.log('💰 New remainder:   ', remCurrent.toFixed(2));
 
-  // 5) Egyetlen mutation a frissítésre
+  // 5) Egyetlen, változókat használó mutáció
   try {
     const mutRes = await fetch(endpoint, {
       method: 'POST',
@@ -117,7 +127,7 @@ module.exports = async (req, res) => {
             orderUpdate(input: {
               id: $orderGid,
               metafields: [
-                { namespace: "custom", key: "order_share",      type: "number_integer", value: $shares },
+                { namespace: "custom", key: "order_share",      type: "number_integer",  value: $shares },
                 { namespace: "custom", key: "osszes_koltes",     type: "number_decimal",  value: $total },
                 { namespace: "custom", key: "fennmarado_osszeg", type: "number_decimal",  value: $rem }
               ]
@@ -127,17 +137,17 @@ module.exports = async (req, res) => {
         variables: {
           custId:   `gid://shopify/Customer/${order.customer.id}`,
           orderGid: `gid://shopify/Order/${order.id}`,
-          total,     // **most számként** adjuk át
-          shares:   newShares,
-          subt:     subtotal,
-          rem:      remCurrent
+          total,      // szám típus
+          shares:     newShares,
+          subt:       subtotal,
+          rem:        remCurrent
         }
       })
     });
     const mjson = await mutRes.json();
     if (mjson.errors?.length) {
       console.error('❌ Mutation-level errors:', mjson.errors);
-      return res.writeHead(500).end('Mutation errors');
+      return res.writeHead(500).end('Mutation-level errors');
     }
     const cuErrs = mjson.data.customerUpdate.userErrors;
     const ouErrs = mjson.data.orderUpdate.userErrors;
@@ -145,7 +155,7 @@ module.exports = async (req, res) => {
       console.error('❌ Field-level userErrors:', { cuErrs, ouErrs });
       return res.writeHead(500).end('UserErrors on mutation');
     }
-    console.log('✅ Mutation succeeded:', JSON.stringify(mjson.data, null,2));
+    console.log('✅ Mutation succeeded:', JSON.stringify(mjson.data, null, 2));
   } catch (e) {
     console.error('❌ Mutation failed:', e);
     return res.writeHead(500).end('Mutation error');
