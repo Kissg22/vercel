@@ -8,6 +8,10 @@
     {
       "src": "/webhook/refund",
       "dest": "/api/webhook-refund.js"
+    },
+    {
+      "src": "/webhook/order-cancel",
+      "dest": "/api/webhook-order-cancel.js"
     }
   ]
 }
