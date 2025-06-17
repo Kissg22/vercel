@@ -2,7 +2,7 @@
 require('dotenv').config();
 const crypto = require('crypto');
 const { recalcCustomer } = require('../lib/recalculate');
-const fetch = require('undici').fetch;
+const { fetch } = require('undici');
 
 async function getRawBody(req) {
   const chunks = [];
@@ -97,17 +97,21 @@ module.exports = async (req, res) => {
   const customerId = String(customerGid).split('/').pop();
   console.log('🔢 Numeric customer ID:', customerId);
 
-  // 7) Fire-and-forget recalcCustomer
-  console.log('🔄 Triggering background recalcCustomer...');
-  recalcCustomer(
-    process.env.SHOPIFY_SHOP_NAME,
-    process.env.SHOPIFY_API_ACCESS_TOKEN,
-    customerId
-  )
-    .then(() => console.log('✅ Background recalcCustomer done'))
-    .catch(err => console.error('❌ Background recalcCustomer error:', err));
+  // 7) Szinkron újraszámolás
+  console.log('🔄 Starting recalcCustomer...');
+  try {
+    await recalcCustomer(
+      process.env.SHOPIFY_SHOP_NAME,
+      process.env.SHOPIFY_API_ACCESS_TOKEN,
+      customerId
+    );
+    console.log('✅ recalcCustomer completed successfully');
+  } catch (err) {
+    console.error('❌ Recalculation failed:', err);
+    return res.writeHead(500).end('Recalc error');
+  }
 
-  // 8) Azonnali 200 OK
-  console.log('🏁 Cancel handler returning 200 OK');
+  // 8) Vissza OK
+  console.log('🏁 Cancel handler finished, sending 200 OK');
   res.writeHead(200).end('OK');
 };

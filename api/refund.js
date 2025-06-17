@@ -30,11 +30,11 @@ module.exports = async (req, res) => {
   }
 
   const hmacHeader = req.headers['x-shopify-hmac-sha256'];
+  console.log('🔐 Received HMAC header:', hmacHeader);
   const computed = crypto
     .createHmac('sha256', process.env.SHOPIFY_API_SECRET_KEY)
     .update(buf)
     .digest('base64');
-  console.log('🔐 Received HMAC header:', hmacHeader);
   console.log('🔑 Computed HMAC:', computed);
 
   if (!hmacHeader || computed !== hmacHeader) {
@@ -53,50 +53,62 @@ module.exports = async (req, res) => {
     return res.writeHead(400).end('Invalid JSON');
   }
 
-  const orderId = payload.order_id;
-  console.log(`🔔 Refund webhook for order_id: ${orderId}`);
+  console.log(`🔔 Received refund webhook for order: ${payload.order_id}`);
 
-  // 4) Customer ID kinyerése REST API‐val
-  let customerId;
-  try {
-    console.log('🔍 Fetching order via REST to get customer ID');
-    const resp = await fetch(
-      `https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/2023-10/orders/${orderId}.json?fields=customer`,
-      {
-        headers: {
-          'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN,
-          'Content-Type': 'application/json'
+  // 4) Customer ID kinyerése
+  let customerGid = payload.customer?.id;
+  console.log('👤 Initial payload.customer.id:', customerGid);
+  if (!customerGid) {
+    console.log('🔍 customer.id missing, fetching via GraphQL order query');
+    const endpoint = `https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/2023-10/graphql.json`;
+    const orderQuery = `
+      query {
+        order(id: "gid://shopify/Order/${payload.order_id}") {
+          customer { id }
         }
       }
-    );
-    if (!resp.ok) throw new Error(`Status ${resp.status}`);
-    const body = await resp.json();
-    customerId = body.order.customer?.id;
-    console.log('✅ REST fetched customer.id:', customerId);
-  } catch (e) {
-    console.error('❌ REST fetch order/customer failed:', e);
+    `;
+    try {
+      const orderRes = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type':           'application/json',
+          'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN
+        },
+        body: JSON.stringify({ query: orderQuery })
+      });
+      const orderJson = await orderRes.json();
+      customerGid = orderJson.data?.order?.customer?.id;
+      console.log('🔍 Fetched customerGid via GraphQL:', customerGid);
+    } catch (e) {
+      console.error('❌ Error fetching order for customer ID:', e);
+      return res.writeHead(500).end('Error fetching customer');
+    }
   }
 
-  if (!customerId) {
-    console.error('❌ No customer ID after REST lookup, aborting');
+  if (!customerGid) {
+    console.error('❌ Still no customer ID available, aborting');
     return res.writeHead(400).end('No customer ID');
   }
 
-  // numeric ID
-  const numericCustomerId = String(customerId).split('/').pop();
-  console.log('🔢 Numeric customer ID:', numericCustomerId);
+  const customerId = String(customerGid).split('/').pop();
+  console.log('🔢 Numeric customer ID:', customerId);
 
-  // 5) Fire-and-forget recalcCustomer
-  console.log('🔄 Triggering background recalcCustomer...');
-  recalcCustomer(
-    process.env.SHOPIFY_SHOP_NAME,
-    process.env.SHOPIFY_API_ACCESS_TOKEN,
-    numericCustomerId
-  )
-    .then(() => console.log('✅ Background recalcCustomer done'))
-    .catch(err => console.error('❌ Background recalcCustomer error:', err));
+  // 5) Teljes újraszámolás
+  console.log('🔄 Starting recalcCustomer...');
+  try {
+    await recalcCustomer(
+      process.env.SHOPIFY_SHOP_NAME,
+      process.env.SHOPIFY_API_ACCESS_TOKEN,
+      customerId
+    );
+    console.log('✅ recalcCustomer completed successfully');
+  } catch (e) {
+    console.error('❌ Recalculation failed:', e);
+    return res.writeHead(500).end('Recalc error');
+  }
 
-  // 6) Azonnali válasz
-  console.log('🏁 Refund handler returning 200 OK');
+  // 6) Válasz
+  console.log('🏁 Refund handling finished, sending 200 OK');
   res.writeHead(200).end('OK');
 };
