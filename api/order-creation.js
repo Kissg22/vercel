@@ -14,14 +14,14 @@ module.exports = async (req, res) => {
     return res.writeHead(405, { Allow: 'POST' }).end('Method Not Allowed');
   }
 
-  // 1) Raw body + HMAC validáció
+  // 1) Raw body + HMAC
   let buf;
   try { buf = await getRawBody(req); }
   catch (e) { console.error('❌ Error reading body:', e); return res.writeHead(400).end('Invalid body'); }
 
-  const hmac    = req.headers['x-shopify-hmac-sha256'];
-  const digest  = crypto.createHmac('sha256', process.env.SHOPIFY_API_SECRET_KEY)
-                        .update(buf).digest('base64');
+  const hmac   = req.headers['x-shopify-hmac-sha256'];
+  const digest = crypto.createHmac('sha256', process.env.SHOPIFY_API_SECRET_KEY)
+                       .update(buf).digest('base64');
   if (!hmac || hmac !== digest) {
     console.error('❌ HMAC validation failed (got %s, expected %s)', hmac, digest);
     return res.writeHead(401).end('HMAC validation failed');
@@ -40,44 +40,7 @@ module.exports = async (req, res) => {
   const endpoint  = `https://${shop}.myshopify.com/admin/api/2023-10/graphql.json`;
   const shareUnit = 12700;
 
-  // 3) Egyetlen GraphQL round-trip: lekérdezzük a korábbi spendinget, 
-  //    majd customerUpdate + orderUpdate egyben
-  const gql = `
-    query getPrevious($custId: ID!) {
-      prev: customer(id: $custId) {
-        mf: metafield(namespace: "loyalty", key: "net_spent_total") { value }
-      }
-    }
-    
-    mutation updateBoth(
-      $custId: ID!,
-      $orderGid: ID!,
-      $newTotal: Decimal!,
-      $newShares: Int!,
-      $subt: Decimal!,
-      $rem: Decimal!
-    ) {
-      cu: customerUpdate(input: {
-        id: $custId,
-        metafields: [
-          { namespace: "loyalty", key: "net_spent_total",  type: "number_decimal",  value: "${'${newTotal}'}" },
-          { namespace: "loyalty", key: "reszvenyek_szama", type: "number_integer",  value: "${'${newShares}'}" },
-          { namespace: "loyalty", key: "last_order_value", type: "number_decimal",  value: "${'${subt}'}" },
-          { namespace: "custom",  key: "jelenlegi_fennmarado", type: "number_decimal", value: "${'${rem}'}" }
-        ]
-      }) { userErrors { field message } }
-      ou: orderUpdate(input: {
-        id: $orderGid,
-        metafields: [
-          { namespace: "custom", key: "order_share",      type: "number_integer", value: "${'${newShares}'}" },
-          { namespace: "custom", key: "osszes_koltes",     type: "number_decimal",  value: "${'${newTotal}'}" },
-          { namespace: "custom", key: "fennmarado_osszeg", type: "number_decimal",  value: "${'${rem}'}" }
-        ]
-      }) { userErrors { field message } }
-    }
-  `;
-
-  // 3a) First: lekérdezzük a prev spendinget
+  // 3) Lekérdezzük a korábbi net_spent_total-t
   let prev = 0;
   try {
     const readRes = await fetch(endpoint, {
@@ -87,53 +50,102 @@ module.exports = async (req, res) => {
         'X-Shopify-Access-Token': token
       },
       body: JSON.stringify({
-        query: gql.split('mutation')[0],
-        variables: { custId: `gid://shopify/Customer/${order.customer.id}` }
+        query: `
+          query getPrev($custId: ID!) {
+            customer(id: $custId) {
+              metafield(namespace: "loyalty", key: "net_spent_total") {
+                value
+              }
+            }
+          }
+        `,
+        variables: {
+          custId: `gid://shopify/Customer/${order.customer.id}`
+        }
       })
     });
-    const { data } = await readRes.json();
-    prev = parseFloat(data.prev?.mf?.value || '0');
+    const { data, errors } = await readRes.json();
+    if (errors?.length) {
+      console.error('❌ GraphQL errors on getPrev:', errors);
+      return res.writeHead(500).end('Error fetching previous spending');
+    }
+    prev = parseFloat(data.customer.metafield?.value || '0');
   } catch (e) {
     console.error('❌ Fetch previous spending failed:', e);
     return res.writeHead(500).end('Fetch previous spending error');
   }
 
-  // 3b) Újraszámoljuk
+  // 4) Új értékek
   const total       = prev + subtotal;
   const prevShares  = Math.floor(prev / shareUnit);
   const totalShares = Math.floor(total / shareUnit);
   const newShares   = totalShares - prevShares;
   const remCurrent  = total % shareUnit;
 
-  console.log('📈 Previous spend:', prev.toFixed(2));
-  console.log('📊 New total spend:', total.toFixed(2));
-  console.log('🎯 New shares:', newShares);
-  console.log('💰 New remainder:', remCurrent.toFixed(2));
+  console.log('📈 Previous spend:  ', prev.toFixed(2));
+  console.log('📊 New total spend: ', total.toFixed(2));
+  console.log('🎯 New shares:      ', newShares);
+  console.log('💰 New remainder:   ', remCurrent.toFixed(2));
 
-  // 3c) Ezután egyszerre küldjük a mutációt
+  // 5) Egyetlen mutation, csak UPDATE-k
   try {
-    const mres = await fetch(endpoint, {
+    const mutRes = await fetch(endpoint, {
       method: 'POST',
       headers: {
         'Content-Type':           'application/json',
         'X-Shopify-Access-Token': token
       },
       body: JSON.stringify({
-        query: gql,
+        query: `
+          mutation updateBoth(
+            $custId: ID!,
+            $orderGid: ID!,
+            $total: Decimal!,
+            $shares: Int!,
+            $subt: Decimal!,
+            $rem: Decimal!
+          ) {
+            customerUpdate(input: {
+              id: $custId,
+              metafields: [
+                { namespace: "loyalty", key: "net_spent_total",  type: "number_decimal",  value: $total },
+                { namespace: "loyalty", key: "reszvenyek_szama", type: "number_integer",  value: $shares },
+                { namespace: "loyalty", key: "last_order_value", type: "number_decimal",  value: $subt },
+                { namespace: "custom",  key: "jelenlegi_fennmarado", type: "number_decimal",  value: $rem }
+              ]
+            }) { userErrors { field message } }
+            orderUpdate(input: {
+              id: $orderGid,
+              metafields: [
+                { namespace: "custom", key: "order_share",      type: "number_integer", value: $shares },
+                { namespace: "custom", key: "osszes_koltes",     type: "number_decimal",  value: $total },
+                { namespace: "custom", key: "fennmarado_osszeg", type: "number_decimal",  value: $rem }
+              ]
+            }) { userErrors { field message } }
+          }
+        `,
         variables: {
-          custId:    `gid://shopify/Customer/${order.customer.id}`,
-          orderGid:  `gid://shopify/Order/${order.id}`,
-          newTotal:  total.toFixed(2),
-          newShares: newShares,
-          subt:      subtotal.toFixed(2),
-          rem:       remCurrent.toFixed(2)
+          custId:   `gid://shopify/Customer/${order.customer.id}`,
+          orderGid: `gid://shopify/Order/${order.id}`,
+          total:    total.toFixed(2),
+          shares:   newShares,
+          subt:     subtotal.toFixed(2),
+          rem:      remCurrent.toFixed(2)
         }
       })
     });
-    const mjson = await mres.json();
-    console.log('✅ Mutation result:', JSON.stringify(mjson, null, 2));
+    const mjson = await mutRes.json();
+    if (mjson.errors?.length) {
+      console.error('❌ Mutation-level errors:', mjson.errors);
+      return res.writeHead(500).end('Mutation errors');
+    }
+    if (mjson.data.customerUpdate.userErrors.length || mjson.data.orderUpdate.userErrors.length) {
+      console.error('❌ Field-level userErrors:', mjson.data);
+      return res.writeHead(500).end('UserErrors on mutation');
+    }
+    console.log('✅ Mutation succeeded:', JSON.stringify(mjson.data, null,2));
   } catch (e) {
-    console.error('❌ Combined mutation failed:', e);
+    console.error('❌ Mutation failed:', e);
     return res.writeHead(500).end('Mutation error');
   }
 
