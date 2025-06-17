@@ -18,6 +18,7 @@ module.exports = async (req, res) => {
   let buf;
   try { buf = await getRawBody(req); }
   catch (e) { console.error('❌ Error reading body:', e); return res.writeHead(400).end('Invalid body'); }
+
   const hmac   = req.headers['x-shopify-hmac-sha256'];
   const digest = crypto.createHmac('sha256', process.env.SHOPIFY_API_SECRET_KEY)
                        .update(buf).digest('base64');
@@ -25,12 +26,12 @@ module.exports = async (req, res) => {
     console.error('❌ HMAC validation failed (got %s, expected %s)', hmac, digest);
     return res.writeHead(401).end('HMAC validation failed');
   }
-  console.log('✅ HMAC passed');
 
-  // 2) Parse payload
+  // 2) Payload parse
   let order;
   try { order = JSON.parse(buf.toString()); }
   catch (e) { console.error('❌ Invalid JSON payload:', e); return res.writeHead(400).end('Invalid JSON'); }
+
   console.log(`🔔 Received order creation: ${order.id}`);
 
   const subtotal   = parseFloat(order.subtotal_price);
@@ -39,7 +40,7 @@ module.exports = async (req, res) => {
   const endpoint   = `https://${shop}.myshopify.com/admin/api/2023-10/graphql.json`;
   const shareUnit  = 12700;
 
-  // 3) Lekérdezzük az előző net_spent_total-t
+  // 3) Lekérdezzük a korábbi net_spent_total-t
   let prev = 0;
   try {
     const readRes = await fetch(endpoint, {
@@ -74,24 +75,23 @@ module.exports = async (req, res) => {
 
   // 4) Új értékek kiszámolása
   const total       = prev + subtotal;
-  const prevShares  = Math.floor(prev / shareUnit);
   const totalShares = Math.floor(total / shareUnit);
-  const newShares   = totalShares - prevShares;
+  const newShares   = totalShares - Math.floor(prev / shareUnit);
   const remCurrent  = total % shareUnit;
 
-  console.log('📈 Previous spend:', prev.toFixed(2));
+  console.log('📈 Previous spend: ', prev.toFixed(2));
   console.log('📊 New total spend:', total.toFixed(2));
-  console.log('🎯 Shares earned:', newShares);
+  console.log('🎯 Shares earned: ', newShares);
   console.log('💰 New remainder:', remCurrent.toFixed(2));
 
-  // 5) Egyetlen mutation – Decimal értékeket inline, csak Int változó
+  // 5) Single inline mutation (minden érték literal)
   const mutation = `
-    mutation updateBoth($custId: ID!, $orderGid: ID!, $shares: Int!) {
+    mutation {
       customerUpdate(input: {
-        id: $custId,
+        id: "gid://shopify/Customer/${order.customer.id}",
         metafields: [
           { namespace: "loyalty", key: "net_spent_total",     type: "number_decimal",  value: "${total.toFixed(2)}" },
-          { namespace: "loyalty", key: "reszvenyek_szama",    type: "number_integer",  value: $shares },
+          { namespace: "loyalty", key: "reszvenyek_szama",    type: "number_integer",  value: "${totalShares}" },
           { namespace: "loyalty", key: "last_order_value",    type: "number_decimal",  value: "${subtotal.toFixed(2)}" },
           { namespace: "custom",  key: "jelenlegi_fennmarado", type: "number_decimal",  value: "${remCurrent.toFixed(2)}" }
         ]
@@ -99,9 +99,9 @@ module.exports = async (req, res) => {
         userErrors { field message }
       }
       orderUpdate(input: {
-        id: $orderGid,
+        id: "gid://shopify/Order/${order.id}",
         metafields: [
-          { namespace: "custom", key: "order_share",      type: "number_integer", value: $shares },
+          { namespace: "custom", key: "order_share",      type: "number_integer", value: "${newShares}" },
           { namespace: "custom", key: "osszes_koltes",     type: "number_decimal",  value: "${total.toFixed(2)}" },
           { namespace: "custom", key: "fennmarado_osszeg", type: "number_decimal",  value: "${remCurrent.toFixed(2)}" }
         ]
@@ -110,20 +110,15 @@ module.exports = async (req, res) => {
       }
     }
   `;
-  const variables = {
-    custId:   `gid://shopify/Customer/${order.customer.id}`,
-    orderGid: `gid://shopify/Order/${order.id}`,
-    shares:   newShares
-  };
 
   try {
-    const mutRes = await fetch(endpoint, {
+    const mutRes  = await fetch(endpoint, {
       method: 'POST',
       headers: {
         'Content-Type':           'application/json',
         'X-Shopify-Access-Token': token
       },
-      body: JSON.stringify({ query: mutation, variables })
+      body: JSON.stringify({ query: mutation })
     });
     const mutJson = await mutRes.json();
     if (mutJson.errors?.length) {
@@ -136,12 +131,11 @@ module.exports = async (req, res) => {
       console.error('❌ Field-level errors:', { cuErrs, ouErrs });
       return res.writeHead(500).end('UserErrors');
     }
-    console.log('✅ Mutation succeeded');
+    console.log('✅ Everything updated successfully.');
   } catch (e) {
     console.error('❌ Mutation failed:', e);
     return res.writeHead(500).end('Mutation error');
   }
 
-  console.log('🏁 Order-creation handler done');
   res.writeHead(200).end('OK');
 };
