@@ -11,116 +11,135 @@ async function getRawBody(req) {
 
 module.exports = async (req, res) => {
   if (req.method !== 'POST') {
-    res.writeHead(405, { Allow: 'POST' });
-    return res.end('Method Not Allowed');
+    return res.writeHead(405, { Allow: 'POST' }).end('Method Not Allowed');
   }
 
-  // 1) Read & verify raw body
+  // 1) Raw body + HMAC ellenőrzés
   let buf;
   try {
     buf = await getRawBody(req);
-  } catch (err) {
-    console.error('Error reading body:', err);
+  } catch (e) {
+    console.error('Error reading body:', e);
     return res.writeHead(400).end('Invalid body');
   }
   const hmac = req.headers['x-shopify-hmac-sha256'];
   if (!hmac) return res.writeHead(400).end('Missing HMAC header');
-  const digest = crypto.createHmac('sha256', process.env.SHOPIFY_API_SECRET_KEY)
-                       .update(buf)
-                       .digest('base64');
-  if (digest !== hmac) return res.writeHead(401).end('HMAC mismatch');
+  const hash = crypto
+    .createHmac('sha256', process.env.SHOPIFY_API_SECRET_KEY)
+    .update(buf)
+    .digest('base64');
+  if (hash !== hmac) return res.writeHead(401).end('HMAC validation failed');
 
   // 2) Parse payload
-  let order;
+  let payload;
   try {
-    order = JSON.parse(buf.toString());
+    payload = JSON.parse(buf.toString());
   } catch {
     return res.writeHead(400).end('Invalid JSON');
   }
-  console.log(`🔔 Order cancelled: ${order.id}`);
+  console.log(`🔔 Order cancelled: ${payload.id}`);
 
   const shareUnit = 12700;
-  const shopName = process.env.SHOPIFY_SHOP_NAME;
-  const token    = process.env.SHOPIFY_API_ACCESS_TOKEN;
-  const endpoint = `https://${shopName}.myshopify.com/admin/api/2023-10/graphql.json`;
+  const shopName  = process.env.SHOPIFY_SHOP_NAME;
+  const token     = process.env.SHOPIFY_API_ACCESS_TOKEN;
+  const endpoint  = `https://${shopName}.myshopify.com/admin/api/2023-10/graphql.json`;
 
-  const cancelledId = order.id;
-  const subtotal    = parseFloat(order.subtotal_price);
-  const customerId  = order.customer?.id;
+  // 3) Customer ID és törölt rendelés adatai
+  const cancelledOrderId = payload.id;
+  const cancelledSubtotal = parseFloat(payload.subtotal_price);
+  const customerId = payload.customer?.id;
   if (!customerId) {
-    console.error('❌ No customer attached to cancelled order.');
+    console.error('No customer attached to cancelled order');
     return res.writeHead(400).end('Customer not found');
   }
 
-  // 3) Fetch all orders for this customer
+  // 4) Lekérjük REST-en az összes rendelést
   let orders;
   try {
-    const ordersQuery = `
-      query {
-        customer(id: "${customerId}") {
-          orders(first: 100, sortKey: CREATED_AT, reverse: false) {
-            edges { node { id name subtotalPriceSet { presentmentMoney { amount } } } }
-          }
+    const numericCustomerId = customerId.split('/').pop();
+    const resp = await fetch(
+      `https://${shopName}.myshopify.com/admin/api/2023-10/orders.json?status=any&customer_id=${numericCustomerId}&limit=250`,
+      {
+        method: 'GET',
+        headers: {
+          'X-Shopify-Access-Token': token,
+          'Content-Type': 'application/json'
         }
-      }`;
-    const resp = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': token
-      },
-      body: JSON.stringify({ query: ordersQuery })
-    });
+      }
+    );
     const json = await resp.json();
-    orders = json.data.customer.orders.edges.map(e => e.node);
-  } catch (err) {
-    console.error('Error fetching customer orders:', err);
+    orders = json.orders || [];
+    // client-side sort created_at asc
+    orders.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+  } catch (e) {
+    console.error('Error fetching orders via REST:', e);
     return res.writeHead(500).end('Error fetching orders');
   }
 
-  // 4) Recalculate cumulatively
-  let cumSpend  = 0;
-  let cumShares = 0;
-  for (const o of orders) {
-    const id       = o.id;
-    const amount   = parseFloat(o.subtotalPriceSet.presentmentMoney.amount);
-    const effective= (id === cancelledId ? 0 : amount);
-    cumSpend += effective;
+  // 5) Kumulatív újraszámolás
+  let cumulativeSpend = 0;
+  let cumulativeShares = 0;
 
-    const newShares = Math.floor(cumSpend/shareUnit) - cumShares;
-    cumShares += newShares;
-    const remainder = cumSpend % shareUnit;
+  for (const ord of orders) {
+    const id = ord.id;
+    // ha ez a törölt, akkor 0, különben az eredeti subtotal
+    const effective = id === cancelledOrderId ? 0 : parseFloat(ord.subtotal_price);
+    cumulativeSpend += effective;
 
-    // update each order
-    const orderMut = `
+    const newShares = Math.floor(cumulativeSpend / shareUnit) - cumulativeShares;
+    cumulativeShares += newShares;
+    const remainder = cumulativeSpend % shareUnit;
+
+    console.log(
+      `→ Recalc ${ord.name}: spend=${cumulativeSpend.toFixed(
+        2
+      )}, shares=${newShares}, rem=${remainder.toFixed(2)}`
+    );
+
+    // 6) Update order metafields
+    const orderMutation = `
       mutation orderUpdate($input: OrderInput!) {
-        orderUpdate(input: $input) {
-          userErrors { field message }
-        }
+        orderUpdate(input: $input) { userErrors { field message } }
       }`;
-    const vars = {
+    const orderVars = {
       input: {
         id,
         metafields: [
-          { namespace: 'custom', key: 'osszes_koltes',     type: 'number_decimal',  value: cumSpend.toFixed(2) },
-          { namespace: 'custom', key: 'order_share',       type: 'number_integer',  value: newShares.toString() },
-          { namespace: 'custom', key: 'fennmarado_osszeg', type: 'number_decimal',  value: remainder.toFixed(2) }
+          {
+            namespace: 'custom',
+            key: 'osszes_koltes',
+            type: 'number_decimal',
+            value: cumulativeSpend.toFixed(2)
+          },
+          {
+            namespace: 'custom',
+            key: 'order_share',
+            type: 'number_integer',
+            value: newShares.toString()
+          },
+          {
+            namespace: 'custom',
+            key: 'fennmarado_osszeg',
+            type: 'number_decimal',
+            value: remainder.toFixed(2)
+          }
         ]
       }
     };
+
     await fetch(endpoint, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': token
+        'X-Shopify-Access-Token': token,
+        'Content-Type': 'application/json'
       },
-      body: JSON.stringify({ query: orderMut, variables: vars })
+      body: JSON.stringify({ query: orderMutation, variables: orderVars })
     });
   }
 
-  // 5) Update customer
+  // 7) Customer metafields frissítése
   try {
-    const customerMut = `
+    const custMutation = `
       mutation customerUpdate($input: CustomerInput!) {
         customerUpdate(input: $input) { userErrors { field message } }
       }`;
@@ -128,22 +147,38 @@ module.exports = async (req, res) => {
       input: {
         id: customerId,
         metafields: [
-          { namespace: 'loyalty', key: 'net_spent_total',     type: 'number_decimal',  value: cumSpend.toFixed(2) },
-          { namespace: 'loyalty', key: 'reszvenyek_szama',    type: 'number_integer',  value: cumShares.toString() },
-          { namespace: 'custom',  key: 'jelenlegi_fennmarado',type: 'number_decimal',  value: (cumSpend % shareUnit).toFixed(2) }
+          {
+            namespace: 'loyalty',
+            key: 'net_spent_total',
+            type: 'number_decimal',
+            value: cumulativeSpend.toFixed(2)
+          },
+          {
+            namespace: 'loyalty',
+            key: 'reszvenyek_szama',
+            type: 'number_integer',
+            value: cumulativeShares.toString()
+          },
+          {
+            namespace: 'custom',
+            key: 'jelenlegi_fennmarado',
+            type: 'number_decimal',
+            value: (cumulativeSpend % shareUnit).toFixed(2)
+          }
         ]
       }
     };
+
     await fetch(endpoint, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': token
+        'X-Shopify-Access-Token': token,
+        'Content-Type': 'application/json'
       },
-      body: JSON.stringify({ query: customerMut, variables: custVars })
+      body: JSON.stringify({ query: custMutation, variables: custVars })
     });
-  } catch (err) {
-    console.error('Error updating customer:', err);
+  } catch (e) {
+    console.error('Error updating customer:', e);
   }
 
   console.log('✅ Cancel-order recalculation done.');
