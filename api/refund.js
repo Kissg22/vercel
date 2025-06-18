@@ -1,7 +1,6 @@
-// api/refund.js
 require('dotenv').config();
 const crypto = require('crypto');
-const { recalcCustomer } = require('../lib/recalculate');
+const { recalculateCustomerPartial } = require('../lib/recalculate-partial');
 const fetch = require('undici').fetch;
 
 async function getRawBody(req) {
@@ -31,13 +30,13 @@ module.exports = async (req, res) => {
 
   const hmacHeader = req.headers['x-shopify-hmac-sha256'];
   console.log('🔐 Received HMAC header:', hmacHeader);
-  const computed = crypto
+  const computedHmac = crypto
     .createHmac('sha256', process.env.SHOPIFY_API_SECRET_KEY)
     .update(buf)
     .digest('base64');
-  console.log('🔑 Computed HMAC:', computed);
+  console.log('🔑 Computed HMAC:', computedHmac);
 
-  if (!hmacHeader || computed !== hmacHeader) {
+  if (!hmacHeader || computedHmac !== hmacHeader) {
     console.error('❌ HMAC validation failed');
     return res.writeHead(401).end('HMAC validation failed');
   }
@@ -55,7 +54,7 @@ module.exports = async (req, res) => {
 
   console.log(`🔔 Received refund webhook for order: ${payload.order_id}`);
 
-  // 4) Customer ID kinyerése
+  // 4) Customer ID extraction
   let customerGid = payload.customer?.id;
   console.log('👤 Initial payload.customer.id:', customerGid);
   if (!customerGid) {
@@ -87,28 +86,24 @@ module.exports = async (req, res) => {
   }
 
   if (!customerGid) {
-    console.error('❌ Still no customer ID available, aborting');
+    console.error('❌ No customer ID available, aborting');
     return res.writeHead(400).end('No customer ID');
   }
 
   const customerId = String(customerGid).split('/').pop();
   console.log('🔢 Numeric customer ID:', customerId);
 
-  // 5) Teljes újraszámolás
-  console.log('🔄 Starting recalcCustomer...');
+  // 5) Inkrementális újraszámolás
+  console.log('🔄 Starting recalculateCustomerPartial...');
   try {
-    await recalcCustomer(
-      process.env.SHOPIFY_SHOP_NAME,
-      process.env.SHOPIFY_API_ACCESS_TOKEN,
-      customerId
-    );
-    console.log('✅ recalcCustomer completed successfully');
-  } catch (e) {
-    console.error('❌ Recalculation failed:', e);
-    return res.writeHead(500).end('Recalc error');
+    await recalculateCustomerPartial(customerId, payload.order_id);
+    console.log('✅ recalculateCustomerPartial completed successfully');
+  } catch (err) {
+    console.error('❌ Partial recalculation failed:', err);
+    return res.writeHead(500).end('Partial recalc error');
   }
 
   // 6) Válasz
-  console.log('🏁 Refund handling finished, sending 200 OK');
+  console.log('🏁 Refund handler finished, sending 200 OK');
   res.writeHead(200).end('OK');
 };

@@ -1,7 +1,6 @@
-// api/order-cancel.js
 require('dotenv').config();
 const crypto = require('crypto');
-const { recalcCustomer } = require('../lib/recalculate');
+const { recalculateCustomerPartial } = require('../lib/recalculate-partial');
 const { fetch } = require('undici');
 
 async function getRawBody(req) {
@@ -97,18 +96,14 @@ module.exports = async (req, res) => {
   const customerId = String(customerGid).split('/').pop();
   console.log('🔢 Numeric customer ID:', customerId);
 
-  // 7) Szinkron újraszámolás
-  console.log('🔄 Starting recalcCustomer...');
+  // 7) Inkrementális újraszámolás
+  console.log('🔄 Starting recalculateCustomerPartial...');
   try {
-    await recalcCustomer(
-      process.env.SHOPIFY_SHOP_NAME,
-      process.env.SHOPIFY_API_ACCESS_TOKEN,
-      customerId
-    );
-    console.log('✅ recalcCustomer completed successfully');
+    await recalculateCustomerPartial(customerId, payload.id);
+    console.log('✅ recalculateCustomerPartial completed successfully');
   } catch (err) {
-    console.error('❌ Recalculation failed:', err);
-    return res.writeHead(500).end('Recalc error');
+    console.error('❌ Partial recalculation failed:', err);
+    return res.writeHead(500).end('Partial recalc error');
   }
 
   // 8) Vissza OK
