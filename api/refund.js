@@ -10,100 +10,65 @@ async function getRawBody(req) {
 }
 
 module.exports = async (req, res) => {
-  console.log('▶️  /refund endpoint hit');
+  console.log('▶️ /refund endpoint hit');
 
-  // 1) Csak POST
   if (req.method !== 'POST') {
-    console.log('✋ Method not allowed:', req.method);
     return res.writeHead(405, { Allow: 'POST' }).end('Method Not Allowed');
   }
 
-  // 2) Raw body + HMAC validáció
   let buf;
   try {
     buf = await getRawBody(req);
-    console.log('✅ Raw body read, length:', buf.length);
   } catch (e) {
-    console.error('❌ Error reading body:', e);
     return res.writeHead(400).end('Invalid body');
   }
 
   const hmacHeader = req.headers['x-shopify-hmac-sha256'];
-  console.log('🔐 Received HMAC header:', hmacHeader);
   const computedHmac = crypto
     .createHmac('sha256', process.env.SHOPIFY_API_SECRET_KEY)
     .update(buf)
     .digest('base64');
-  console.log('🔑 Computed HMAC:', computedHmac);
 
   if (!hmacHeader || computedHmac !== hmacHeader) {
-    console.error('❌ HMAC validation failed');
     return res.writeHead(401).end('HMAC validation failed');
   }
-  console.log('✅ HMAC validation passed');
 
-  // 3) Payload parse
   let payload;
   try {
     payload = JSON.parse(buf.toString());
-    console.log('📦 Parsed payload:', payload);
-  } catch (e) {
-    console.error('❌ Invalid JSON:', e);
+  } catch {
     return res.writeHead(400).end('Invalid JSON');
   }
 
-  console.log(`🔔 Received refund webhook for order: ${payload.order_id}`);
-
-  // 4) Customer ID extraction
+  const orderId = payload.order_id;
   let customerGid = payload.customer?.id;
-  console.log('👤 Initial payload.customer.id:', customerGid);
   if (!customerGid) {
-    console.log('🔍 customer.id missing, fetching via GraphQL order query');
     const endpoint = `https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/2023-10/graphql.json`;
-    const orderQuery = `
-      query {
-        order(id: "gid://shopify/Order/${payload.order_id}") {
-          customer { id }
-        }
-      }
-    `;
+    const query = `query { order(id: \"gid://shopify/Order/${orderId}\") { customer { id } } }`;
     try {
-      const orderRes = await fetch(endpoint, {
+      const r = await fetch(endpoint, {
         method: 'POST',
         headers: {
-          'Content-Type':           'application/json',
+          'Content-Type': 'application/json',
           'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN
         },
-        body: JSON.stringify({ query: orderQuery })
+        body: JSON.stringify({ query })
       });
-      const orderJson = await orderRes.json();
-      customerGid = orderJson.data?.order?.customer?.id;
-      console.log('🔍 Fetched customerGid via GraphQL:', customerGid);
-    } catch (e) {
-      console.error('❌ Error fetching order for customer ID:', e);
-      return res.writeHead(500).end('Error fetching customer');
-    }
+      const j = await r.json();
+      customerGid = j.data?.order?.customer?.id;
+    } catch {}
   }
 
   if (!customerGid) {
-    console.error('❌ No customer ID available, aborting');
     return res.writeHead(400).end('No customer ID');
   }
 
   const customerId = String(customerGid).split('/').pop();
-  console.log('🔢 Numeric customer ID:', customerId);
-
-  // 5) Inkrementális újraszámolás
-  console.log('🔄 Starting recalculateCustomerPartial...');
   try {
-    await recalculateCustomerPartial(customerId, payload.order_id);
-    console.log('✅ recalculateCustomerPartial completed successfully');
+    await recalculateCustomerPartial(customerId, orderId);
   } catch (err) {
-    console.error('❌ Partial recalculation failed:', err);
     return res.writeHead(500).end('Partial recalc error');
   }
 
-  // 6) Válasz
-  console.log('🏁 Refund handler finished, sending 200 OK');
   res.writeHead(200).end('OK');
 };
